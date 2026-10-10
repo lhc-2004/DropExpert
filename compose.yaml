@@ -1,0 +1,9 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: dropexpert
+      POSTGRES_USER: dropexpert
+      POSTGRES_PASSWORD: dropexpert
+    ports:
+      - "5432:5432"
