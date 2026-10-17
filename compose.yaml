@@ -40,6 +40,25 @@ services:
       redis:
         condition: service_healthy
 
+  worker:
+    build: ./app
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/dropexpert
+      SPRING_DATA_REDIS_HOST: redis
+      APP_ROLE: worker
+      SPRING_MAIN_WEB_APPLICATION_TYPE: none
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1"
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   nginx:
     image: nginx:stable
     volumes:
