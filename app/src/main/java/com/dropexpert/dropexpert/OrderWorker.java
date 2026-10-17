@@ -2,16 +2,19 @@ package com.dropexpert.dropexpert;
 
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.connection.stream.Consumer;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamOffset;
 import org.springframework.data.redis.connection.stream.StreamReadOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -22,20 +25,26 @@ public class OrderWorker implements CommandLineRunner {
 
     public static final String GROUP = "order-workers";
 
+    // ON CONFLICT DO NOTHING: if this purchaseId is already saved, skip it quietly (idempotency)
+    private static final String INSERT_SQL =
+            "INSERT INTO orders (purchase_id, drop_id, user_id, created_at) " +
+            "VALUES (?, ?, ?, clock_timestamp()) " +
+            "ON CONFLICT (purchase_id) DO NOTHING";
+
     private final StringRedisTemplate redis;
-    private final PurchaseOrderRepository orderRepository;
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate transaction;
     private final String consumerName;
 
-    public OrderWorker(StringRedisTemplate redis, PurchaseOrderRepository orderRepository) {
+    public OrderWorker(StringRedisTemplate redis, JdbcTemplate jdbc, TransactionTemplate transaction) {
         this.redis = redis;
-        this.orderRepository = orderRepository;
-        // Each worker needs its own name inside the group. Docker gives every container a unique HOSTNAME.
+        this.jdbc = jdbc;
+        this.transaction = transaction;
         this.consumerName = "worker-" + System.getenv().getOrDefault("HOSTNAME", UUID.randomUUID().toString());
     }
 
     @Override
     public void run(String... args) {
-        // Run the loop on its own thread so the app finishes starting up
         new Thread(this::loop, "order-worker").start();
     }
 
@@ -43,21 +52,21 @@ public class OrderWorker implements CommandLineRunner {
         System.out.println(consumerName + " started, waiting for purchases...");
         while (true) {
             try {
-                // Ask Redis for up to 50 new tickets for this worker; wait up to 2 seconds if there are none
+                // Grab up to 50 new tickets; wait up to 2 seconds if there are none
                 List<MapRecord<String, Object, Object>> records = redis.opsForStream().read(
                         Consumer.from(GROUP, consumerName),
                         StreamReadOptions.empty().count(50).block(Duration.ofSeconds(2)),
                         StreamOffset.create(PurchaseService.STREAM_KEY, ReadOffset.lastConsumed()));
 
-                if (records == null) {
+                if (records == null || records.isEmpty()) {
                     continue;
                 }
 
-                for (MapRecord<String, Object, Object> record : records) {
-                    saveOrder(record.getValue());
-                    // Only AFTER the order is saved: tell Redis this ticket is done
-                    redis.opsForStream().acknowledge(PurchaseService.STREAM_KEY, GROUP, record.getId());
-                }
+                saveBatch(records);
+
+                // Only AFTER the whole batch is saved: mark all its tickets done in one call
+                RecordId[] ids = records.stream().map(MapRecord::getId).toArray(RecordId[]::new);
+                redis.opsForStream().acknowledge(PurchaseService.STREAM_KEY, GROUP, ids);
             } catch (Exception e) {
                 if (isMissingGroup(e)) {
                     createGroupIfPossible();
@@ -69,16 +78,28 @@ public class OrderWorker implements CommandLineRunner {
         }
     }
 
-    private void saveOrder(Map<Object, Object> fields) {
-        String purchaseId = String.valueOf(fields.get("purchaseId"));
-        Long dropId = Long.valueOf(String.valueOf(fields.get("dropId")));
-        String userId = String.valueOf(fields.get("userId"));
-        try {
-            orderRepository.save(new PurchaseOrder(purchaseId, dropId, userId));
-        } catch (DataIntegrityViolationException duplicate) {
-            // The unique rule on purchase_id refused a second copy:
-            // this order was already saved, so there is nothing to do.
-            System.out.println("Order " + purchaseId + " already saved, skipping duplicate");
+    private void saveBatch(List<MapRecord<String, Object, Object>> records) {
+        List<Object[]> rows = new ArrayList<>();
+        for (MapRecord<String, Object, Object> record : records) {
+            Map<Object, Object> fields = record.getValue();
+            rows.add(new Object[]{
+                    String.valueOf(fields.get("purchaseId")),
+                    Long.valueOf(String.valueOf(fields.get("dropId"))),
+                    String.valueOf(fields.get("userId"))
+            });
+        }
+
+        // One transaction = ONE commit for the whole batch, instead of one commit per order
+        int[] results = transaction.execute(status -> jdbc.batchUpdate(INSERT_SQL, rows));
+
+        int skipped = 0;
+        if (results != null) {
+            for (int r : results) {
+                if (r == 0) skipped++;   // 0 rows inserted = this purchaseId was already saved
+            }
+        }
+        if (skipped > 0) {
+            System.out.println("Skipped " + skipped + " already-saved order(s)");
         }
     }
 
@@ -93,10 +114,9 @@ public class OrderWorker implements CommandLineRunner {
 
     private void createGroupIfPossible() {
         if (!Boolean.TRUE.equals(redis.hasKey(PurchaseService.STREAM_KEY))) {
-            return; // No purchases yet, so no queue exists. Try again shortly.
+            return;
         }
         try {
-            // "0" = start from the very first ticket in the queue
             redis.opsForStream().createGroup(PurchaseService.STREAM_KEY, ReadOffset.from("0"), GROUP);
             System.out.println("Created consumer group " + GROUP);
         } catch (Exception alreadyExists) {
