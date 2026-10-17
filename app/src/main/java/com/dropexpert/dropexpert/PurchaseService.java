@@ -1,36 +1,44 @@
 package com.dropexpert.dropexpert;
 
-import org.springframework.http.HttpStatus;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.util.UUID;
 
 @Service
 public class PurchaseService {
 
-    private final DropRepository dropRepository;
+    private final StringRedisTemplate redis;
     private final PurchaseOrderRepository orderRepository;
 
-    public PurchaseService(DropRepository dropRepository, PurchaseOrderRepository orderRepository) {
-        this.dropRepository = dropRepository;
+    public PurchaseService(StringRedisTemplate redis, PurchaseOrderRepository orderRepository) {
+        this.redis = redis;
         this.orderRepository = orderRepository;
     }
 
-    @Transactional
+    public static String inventoryKey(Long dropId) {
+        return "drop:" + dropId + ":remaining";
+    }
+
     public PurchaseResponse purchase(Long dropId, String userId) {
-        // 1. READ: load the drop from the database
-        Drop drop = dropRepository.findById(dropId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Drop not found"));
+        String key = inventoryKey(dropId);
+
+        // 1. READ the shared count from Redis
+        String value = redis.opsForValue().get(key);
+        if (value == null) {
+            return new PurchaseResponse("SOLD_OUT", null);
+        }
+        long remaining = Long.parseLong(value);
 
         // 2. CHECK: is anything left?
-        if (drop.getRemainingUnits() <= 0) {
+        if (remaining <= 0) {
             return new PurchaseResponse("SOLD_OUT", null);
         }
 
-        // 3. WRITE: take one unit and create the order
-        drop.decrementRemaining();
+        // 3. WRITE: take one unit.
+        // DECR by itself is safe, but steps 1-3 together are NOT one step.
+        redis.opsForValue().decrement(key);
+
         String purchaseId = UUID.randomUUID().toString();
         orderRepository.save(new PurchaseOrder(purchaseId, dropId, userId));
 

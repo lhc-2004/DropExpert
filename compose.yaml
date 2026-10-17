@@ -13,15 +13,28 @@ services:
       timeout: 3s
       retries: 15
 
+  redis:
+    image: redis:7.4
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   api:
     build: ./app
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/dropexpert
+      SPRING_DATA_REDIS_HOST: redis
     deploy:
       replicas: 3
     restart: on-failure
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   nginx:
