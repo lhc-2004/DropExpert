@@ -11,7 +11,8 @@ import java.util.UUID;
 @Service
 public class PurchaseService {
 
-    // Load reserve.lua once, when the app starts
+    public static final String STREAM_KEY = "purchases";
+
     private static final DefaultRedisScript<Long> RESERVE_SCRIPT = new DefaultRedisScript<>();
     static {
         RESERVE_SCRIPT.setLocation(new ClassPathResource("scripts/reserve.lua"));
@@ -19,11 +20,9 @@ public class PurchaseService {
     }
 
     private final StringRedisTemplate redis;
-    private final PurchaseOrderRepository orderRepository;
 
-    public PurchaseService(StringRedisTemplate redis, PurchaseOrderRepository orderRepository) {
+    public PurchaseService(StringRedisTemplate redis) {
         this.redis = redis;
-        this.orderRepository = orderRepository;
     }
 
     public static String inventoryKey(Long dropId) {
@@ -31,16 +30,19 @@ public class PurchaseService {
     }
 
     public PurchaseResponse purchase(Long dropId, String userId) {
-        // Read, check and subtract in ONE uninterruptible Redis step
-        Long reserved = redis.execute(RESERVE_SCRIPT, List.of(inventoryKey(dropId)));
+        String purchaseId = UUID.randomUUID().toString();
+
+        // Reserve a unit AND queue the purchase, in one Redis step
+        Long reserved = redis.execute(
+                RESERVE_SCRIPT,
+                List.of(inventoryKey(dropId), STREAM_KEY),
+                purchaseId, dropId.toString(), userId);
 
         if (reserved == null || reserved == 0) {
             return new PurchaseResponse("SOLD_OUT", null);
         }
 
-        String purchaseId = UUID.randomUUID().toString();
-        orderRepository.save(new PurchaseOrder(purchaseId, dropId, userId));
-
-        return new PurchaseResponse("ACCEPTED", purchaseId);
+        // No database work here anymore. A worker will save the order later.
+        return new PurchaseResponse("PROCESSING", purchaseId);
     }
 }
